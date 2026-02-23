@@ -1,0 +1,5 @@
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+yfinance==0.2.40
+slowapi==0.1.9
+pytz==2024.1
