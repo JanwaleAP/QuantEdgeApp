@@ -1,0 +1,164 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch: # allows manual trigger from GitHub UI
+
+jobs:
+  build-android:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout code ───────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Setup Node.js ───────────────────────────────────────────────────
+      - name: Setup Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      # ── 3. Setup Java JDK 17 ──────────────────────────────────────────────
+      - name: Setup Java JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      # ── 4. Setup Android SDK ───────────────────────────────────────────────
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      # ── 5. Cache Gradle ────────────────────────────────────────────────────
+      - name: Cache Gradle packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      # ── 6. Install npm dependencies ────────────────────────────────────────
+      - name: Install npm dependencies
+        run: npm install
+
+      # ── 7. Create local.properties for Android SDK path ───────────────────
+      - name: Create local.properties
+        run: echo "sdk.dir=$ANDROID_SDK_ROOT" > android/local.properties
+
+      # ── 8. Make gradlew executable ────────────────────────────────────────
+      - name: Make gradlew executable
+        run: chmod +x android/gradlew
+
+      # ── 9. Create keystore for signing ────────────────────────────────────
+      - name: Create release keystore
+        run: |
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > android/app/quantedge.keystore
+        # If no keystore secret set, create a debug-signed APK instead
+        continue-on-error: true
+
+      # ── 10. Build Release APK (signed) ────────────────────────────────────
+      - name: Build Release APK
+        run: |
+          cd android
+          ./gradlew assembleRelease \
+            -PMYAPP_UPLOAD_STORE_FILE=quantedge.keystore \
+            -PMYAPP_UPLOAD_KEY_ALIAS=${{ secrets.KEY_ALIAS || 'quantedge' }} \
+            -PMYAPP_UPLOAD_STORE_PASSWORD=${{ secrets.STORE_PASSWORD || 'quantedge123' }} \
+            -PMYAPP_UPLOAD_KEY_PASSWORD=${{ secrets.KEY_PASSWORD || 'quantedge123' }}
+        env:
+          GRADLE_OPTS: -Xmx4g -XX:MaxMetaspaceSize=512m
+
+      # ── 11. Fallback: Build Debug APK if release fails ────────────────────
+      - name: Build Debug APK (fallback)
+        if: failure()
+        run: |
+          cd android
+          ./gradlew assembleDebug
+        env:
+          GRADLE_OPTS: -Xmx4g
+
+      # ── 12. Get version name for filename ─────────────────────────────────
+      - name: Get version info
+        id: version
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          BUILD_DATE=$(date +'%Y%m%d-%H%M')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "build_date=$BUILD_DATE" >> $GITHUB_OUTPUT
+
+      # ── 13. Rename APK with version ───────────────────────────────────────
+      - name: Rename APK
+        run: |
+          # Try release first, fallback to debug
+          if [ -f android/app/build/outputs/apk/release/app-release.apk ]; then
+            cp android/app/build/outputs/apk/release/app-release.apk \
+               android/app/build/outputs/apk/release/QuantEdge-v${{ steps.version.outputs.version }}-${{ steps.version.outputs.build_date }}.apk
+            echo "APK_PATH=android/app/build/outputs/apk/release/QuantEdge-v${{ steps.version.outputs.version }}-${{ steps.version.outputs.build_date }}.apk" >> $GITHUB_ENV
+          else
+            cp android/app/build/outputs/apk/debug/app-debug.apk \
+               android/app/build/outputs/apk/debug/QuantEdge-v${{ steps.version.outputs.version }}-${{ steps.version.outputs.build_date }}-debug.apk
+            echo "APK_PATH=android/app/build/outputs/apk/debug/QuantEdge-v${{ steps.version.outputs.version }}-${{ steps.version.outputs.build_date }}-debug.apk" >> $GITHUB_ENV
+          fi
+
+      # ── 14. Upload APK as artifact (downloadable for 30 days) ─────────────
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: QuantEdge-APK-v${{ steps.version.outputs.version }}-${{ steps.version.outputs.build_date }}
+          path: |
+            android/app/build/outputs/apk/release/*.apk
+            android/app/build/outputs/apk/debug/*.apk
+          retention-days: 30
+          if-no-files-found: warn
+
+      # ── 15. Create GitHub Release with APK attached ───────────────────────
+      - name: Create GitHub Release
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}-${{ steps.version.outputs.build_date }}
+          name: QuantEdge AI v${{ steps.version.outputs.version }}
+          body: |
+            ## QuantEdge AI Market Oracle
+            
+            **Build Date:** ${{ steps.version.outputs.build_date }}
+            **Commit:** ${{ github.sha }}
+            
+            ### What's included:
+            - Live NSE/BSE stock prices (85+ stocks)
+            - AI-powered predictions with ensemble models
+            - Black-Scholes options pricing
+            - Trading signals
+            - Watchlist
+            
+            ### Install:
+            1. Download the APK file below
+            2. On your Android phone: Settings → Security → Allow unknown sources
+            3. Open the downloaded APK and install
+          files: |
+            android/app/build/outputs/apk/release/*.apk
+            android/app/build/outputs/apk/debug/*.apk
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 16. Post build summary ────────────────────────────────────────────
+      - name: Build Summary
+        run: |
+          echo "## ✅ Build Complete!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** v${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Build Date:** ${{ steps.version.outputs.build_date }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📥 Download APK:" >> $GITHUB_STEP_SUMMARY
+          echo "Go to **Actions tab** → This workflow run → **Artifacts** section" >> $GITHUB_STEP_SUMMARY
